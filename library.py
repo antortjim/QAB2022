@@ -70,7 +70,10 @@ def crop_animal_in_time_and_space(frame, contour, other_contours, centroid, body
 
     angle, (T, mask, cloud, cloud_centered, cloud_center)=find_angle(easy_crop, centered_contour, body_size=body_size)
     rotated, rotate_matrix = rotate_frame(raw_crop, angle)
-    mmpy_frame, _ = package_frame_for_labeling(rotated, center=([e//2 for e in rotated.shape[:2][::-1]]), box_size=conf.MMPY_BOX)
+    
+    easy_rotated, _ = rotate_frame(easy_crop, angle)
+
+    mmpy_frame, _ = package_frame_for_labeling(easy_rotated, center=([e//2 for e in rotated.shape[:2][::-1]]), box_size=conf.MMPY_BOX)
     sleap_frame, _ = package_frame_for_labeling(rotated, center=([e//2 for e in rotated.shape[:2][::-1]]), box_size=conf.SLEAP_BOX)
     
     frames = {"sleap": sleap_frame, "mmpy": mmpy_frame}
@@ -86,6 +89,7 @@ def crop_animal_in_time_and_space(frame, contour, other_contours, centroid, body
         if conf.DEBUG:
             print(f'Saving -> {path}')
 
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         cv2.imwrite(path, frames[folder])
 
     return raw_crop, rotated, (T, mask, cloud, cloud_centered, cloud_center, rotate_matrix)
@@ -245,7 +249,7 @@ def find_polarity(crop, mask, rotated, rotate_matrix, body_size, filepath):
     else:
         flip=False
     
-    if filepath is not None:
+    if filepath is not None and conf.DEBUG:
         cv2.imwrite(os.path.join(conf.DEBUG_FOLDER, filepath.replace(".png", "_top-area_5.png")), top_area)
         cv2.imwrite(os.path.join(conf.DEBUG_FOLDER, filepath.replace(".png", "_bottom-area_5.png")), bottom_area)    
     return flip
@@ -266,8 +270,8 @@ def generate_dataset(experiment, sampling_points, tolerance=100):
     
     * tolerance (int): Tolerance between wished sampling time and available time in dataset, in msec
     """
-
-
+    
+    print(experiment)
     
     tr_file = get_trajectories_file(experiment)
     time_file = get_timestamps_file(experiment)
@@ -327,8 +331,10 @@ def generate_dataset(experiment, sampling_points, tolerance=100):
         for animal in np.arange(trajectories.shape[1]):
         
             # define where the files will be saved
-            filepath = os.path.join(experiment, str(frame_number).zfill(10), str(animal) + ".png").replace("/", "-")
-            
+            filepath = os.path.join(
+                experiment,
+                os.path.join(experiment, str(frame_number).zfill(10), str(animal) + ".png").replace("/", "-")
+            ) 
             # pick the data for this animal
             tr = trajectories_frame[animal, :]
 
