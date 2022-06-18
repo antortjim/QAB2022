@@ -1,12 +1,23 @@
 import os.path
 import warnings
 import logging
+import pickle
+from matplotlib.font_manager import list_fonts
+import tqdm
+import glob
+from collections import OrderedDict
 
+import joblib
+import threading
+import yaml
 import numpy as np
 import cv2
 import idtrackerai.list_of_blobs
 import imgstore
 import tqdm
+import matplotlib.pyplot as plt
+from scipy.ndimage import center_of_mass
+from codetiming import Timer # https://github.com/realpython/codetiming
 
 from contour import center_blob_in_mask, find_contour
 from plotting import plot_rotation
@@ -17,10 +28,9 @@ from get_files import (
     get_collections_file,
     get_store_path
 )
-from utils import package_frame_for_labeling
+from utils import package_frame_for_labeling, obtain_real_frame_number
 
 from confapp import conf
-
 
 try:
     import local_settings
@@ -30,17 +40,20 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+timer_logger = logging.getLogger(f"{__name__}.timer")
 
-def crop_animal_in_time_and_space(frame, contour, other_contours, centroid, body_size, filepath):
+def crop_animal_in_time_and_space(frame, centroid, body_size, filepath, contour, other_contours, thresholds=None):
     """
     Crop a box in the frame around the focal fly and rotate it so the animal points east 
     
     Arguments:
     
-        * frame (np.ndarray): raw frame from the dataset
-        * contour (np.ndarray): outline of the contour of one of the animals (focal) in the frame, in raw coordinates
-        * centroid (tuple): x and y coordinates of the center of the focal animal
+        * frame (np.ndarray): a copy of a raw frame from a flyhostel dataset
+        * centroid (tuple): x and y coordinates of the center of the focal animal, with the origin (0, 0) set to the top left corner
+        * body_size (int): Expected number of pixels on the longest axes of the animal (each animal should have a value around this, but not exactly this)
         * filepath (str): Path to a .png file
+        * contour (np.ndarray): outline of the contour of one of the animals (focal) in the frame, in raw coordinates
+        * other_contours (list): list of outline of the contours of other animals which may appear on the frame
     
     Returns:
         * rotated (np.ndarray): crop of the raw frame with the focal animal pointing east 
@@ -48,33 +61,61 @@ def crop_animal_in_time_and_space(frame, contour, other_contours, centroid, body
 
     if contour is None:
         warnings.warn(f"No contour detected in {filepath}", stacklevel=2)
-        return
+        return None, None, None
    
     # mask the other contours
-    easy_frame=cv2.drawContours(frame.copy(), other_contours, -1, 255, -1)
+    with Timer(text="Masking other contours took {:.8f}", logger=timer_logger.debug):
+        easy_frame=cv2.drawContours(frame.copy(), other_contours, -1, 255, -1)
 
     if conf.CENTRAL_BOX_SIZE is None:
         CENTRAL_BOX_SIZE=body_size*3
     else:
         CENTRAL_BOX_SIZE=conf.CENTRAL_BOX_SIZE
-    
-    easy_crop, bbox = package_frame_for_labeling(
-        easy_frame, centroid, CENTRAL_BOX_SIZE
-    )
-    raw_crop, bbox = package_frame_for_labeling(
-        frame, centroid, CENTRAL_BOX_SIZE
-    )
 
-    top_left_corner = bbox[:2]
-    centered_contour=contour-top_left_corner
+    with Timer(text="Expanding frame took {:.8f}", logger=timer_logger.debug):
+        # expand the frame with white so the box is never out of bounds
+        easy_frame=cv2.copyMakeBorder(
+            easy_frame,
+            CENTRAL_BOX_SIZE,
+            CENTRAL_BOX_SIZE,
+            CENTRAL_BOX_SIZE,
+            CENTRAL_BOX_SIZE,
+            cv2.BORDER_CONSTANT,
+            255   
+        )
+        frame=cv2.copyMakeBorder(
+            frame,
+            CENTRAL_BOX_SIZE,
+            CENTRAL_BOX_SIZE,
+            CENTRAL_BOX_SIZE,
+            CENTRAL_BOX_SIZE,
+            cv2.BORDER_CONSTANT,
+            255   
+        )
+        
+        centroid=tuple([centroid[0]+CENTRAL_BOX_SIZE, centroid[1]+CENTRAL_BOX_SIZE])
+        contour+=CENTRAL_BOX_SIZE
 
-    angle, (T, mask, cloud, cloud_centered, cloud_center)=find_angle(easy_crop, centered_contour, body_size=body_size)
-    rotated, rotate_matrix = rotate_frame(raw_crop, angle)
-    
-    easy_rotated, _ = rotate_frame(easy_crop, angle)
+    with Timer(text="Packaging frame took {:.8f}", logger=timer_logger.debug):
+        easy_crop, bbox = package_frame_for_labeling(
+            easy_frame, centroid, CENTRAL_BOX_SIZE
+        )
+        raw_crop, bbox = package_frame_for_labeling(
+            frame, centroid, CENTRAL_BOX_SIZE
+        )
 
-    mmpy_frame, _ = package_frame_for_labeling(easy_rotated, center=([e//2 for e in rotated.shape[:2][::-1]]), box_size=conf.MMPY_BOX)
-    sleap_frame, _ = package_frame_for_labeling(rotated, center=([e//2 for e in rotated.shape[:2][::-1]]), box_size=conf.SLEAP_BOX)
+        top_left_corner = bbox[:2]
+        centered_contour=contour-top_left_corner
+
+    with Timer(text="Computing angle took {:.8f}", logger=timer_logger.debug):
+        angle, (T, mask, cloud, cloud_centered, cloud_center)=find_angle(easy_crop, centered_contour, body_size=body_size)
+    with Timer(text="Rotating frames took {:.8f}", logger=timer_logger.debug):
+        rotated, rotate_matrix = rotate_frame(raw_crop, angle)
+        easy_rotated, _ = rotate_frame(easy_crop, angle)
+
+    with Timer(text="Packaging frame (II) took {:.8f}", logger=timer_logger.debug):
+        mmpy_frame, _ = package_frame_for_labeling(easy_rotated, center=([e//2 for e in rotated.shape[:2][::-1]]), box_size=conf.MMPY_BOX)
+        sleap_frame, _ = package_frame_for_labeling(rotated, center=([e//2 for e in rotated.shape[:2][::-1]]), box_size=conf.SLEAP_BOX)
     
     frames = {"sleap": sleap_frame, "mmpy": mmpy_frame}
 
@@ -83,16 +124,13 @@ def crop_animal_in_time_and_space(frame, contour, other_contours, centroid, body
 
     # save
     for folder in conf.DATASET_FOLDER:
-        os.makedirs(conf.DATASET_FOLDER[folder], exist_ok=True)
-        path=os.path.join(conf.DATASET_FOLDER[folder], filepath.replace(".png", "_05_final.png"))
-        
-        if conf.DEBUG:
-            print(f'Saving -> {path}')
+        path=os.path.join(conf.DATASET_FOLDER[folder], "step1", filepath.replace(".png", "_05_final.png"))
+        with Timer(text=f"Saving {path} took " + "{:.8f}", logger=timer_logger.debug):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            logger.debug(f'Saving -> {path}')
+            cv2.imwrite(path, frames[folder])
 
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        cv2.imwrite(path, frames[folder])
-
-    return raw_crop, rotated, (T, mask, cloud, cloud_centered, cloud_center, rotate_matrix)
+    return raw_crop, rotated, (T, mask, cloud, cloud_centered, cloud_center, rotate_matrix, top_left_corner)
 
 
 def find_angle(crop, contour, body_size, point_to=90):
@@ -145,14 +183,17 @@ def find_angle(crop, contour, body_size, point_to=90):
 
     cloud_center = center_blob_in_mask(mask)
     
-    if conf.DEBUG:
-        print(f"Cloud center {cloud_center}")
+    logger.debug(f"Cloud center {cloud_center}")
 
     # center the contour around its mean
     cloud_centered=cloud-cloud_center
 
+
     # compute the covariance matrix
-    cov_matrix = np.cov(cloud_centered.T)
+    cov_matrix = np.cov(cloud_centered[
+        np.random.choice(np.arange(cloud_centered.shape[0]), size=100, replace=False),
+        :
+    ].T)
     
     # Eigendecomposition
     ################################
@@ -167,10 +208,9 @@ def find_angle(crop, contour, body_size, point_to=90):
     v1 = T[:, 0]
     v2 = T[:, 1]
 
-    if conf.DEBUG:
-        print(f"Eigenvalues: {vals}")
-        print(f"First eigenvector {v1}")
-        print(f"Second eigenvector {v2}")
+    logger.debug(f"Eigenvalues: {vals}")
+    logger.debug(f"First eigenvector {v1}")
+    logger.debug(f"Second eigenvector {v2}")
 
     # Singular Value Decomposition
     ################################
@@ -183,8 +223,7 @@ def find_angle(crop, contour, body_size, point_to=90):
     # transform to degrees
     angle_deg=angle*360/(np.pi*2)-point_to
     
-    if conf.DEBUG:
-        print(f"Angle {angle_deg} degrees")
+    logger.debug(f"Angle {angle_deg} degrees")
 
 
     rotated, rotate_matrix = rotate_frame(crop, angle_deg)
@@ -218,6 +257,8 @@ def rotate_frame(img, angle):
 def find_polarity(crop, mask, rotated, rotate_matrix, body_size, filepath):
     rotated_mask = cv2.warpAffine(src=mask, M=rotate_matrix, dsize=crop.shape[:2][::-1])
     boolean_mask = rotated_mask == 255
+
+    assert boolean_mask.sum() > 0
     
     coord_max=np.where(boolean_mask)[1].max()
     coord_min=np.where(boolean_mask)[1].min()
@@ -240,9 +281,8 @@ def find_polarity(crop, mask, rotated, rotate_matrix, body_size, filepath):
     top_area=cv2.bitwise_and(rotated.copy(), top_mask)
     bottom_area=cv2.bitwise_and(rotated.copy(), bottom_mask)
     
-    if conf.DEBUG:
-        print(f"Intensity in top circle: {top_area.mean()}")
-        print(f"Intensity in bottom circle: {bottom_area.mean()}")
+    logger.debug(f"Intensity in top circle: {top_area.mean()}")
+    logger.debug(f"Intensity in bottom circle: {bottom_area.mean()}")
     
     if top_area.mean() < bottom_area.mean():
         flip=True
@@ -254,9 +294,453 @@ def find_polarity(crop, mask, rotated, rotate_matrix, body_size, filepath):
         cv2.imwrite(os.path.join(conf.DEBUG_FOLDER, filepath.replace(".png", "_bottom-area_5.png")), bottom_area)    
     return flip
 
-def generate_dataset(experiment, sampling_points, tolerance=100):
+
+def plot_intensity_histogram(experiment):
+
+
+    files = glob.glob(
+        os.path.join(
+            conf.DATASET_FOLDER["mmpy"], "step1", experiment, "*"
+        )
+    )
+
+    arrs = [
+        cv2.imread(f) for f in files
+    ]
+    
+    data=np.float64(np.stack(arrs, axis=-1).flatten())
+
+    data-=data.min()
+    data/=data.max()
+    data*=255
+    y,x=np.histogram(data, bins=255)
+    WINDOW_LENGTH=5
+    def moving_average(x, w):
+        return np.convolve(x, np.ones(w), 'valid') / w
+
+    # smoothen potential outliers by taking a rolling mean
+    y_round=moving_average(y, WINDOW_LENGTH)
+    # discard the last bin because it's biased by the other contour masking
+    # (which sets the pixels there to 255)
+    y_round=y_round[:-1]
+
+    # make a probability-like distrib
+    y_round /= y_round.sum()
+    x_round=x[:-(WINDOW_LENGTH+1)]
+
+    fig=plt.figure(figsize=(20, 10))
+    ax=fig.add_subplot()
+    ax.bar(x_round, y_round)
+    ax.set_xticks(np.arange(0, 255, 5), np.arange(0, 255, 5))
+    fn=os.path.join(conf.HISTOGRAM_FOLDER, experiment+".png")
+    os.makedirs(os.path.dirname(fn), exist_ok=True)
+    plt.savefig(fn)
+
+def load_thresholds(experiment):
+
+    file = os.path.join(conf.VIDEO_FOLDER, experiment, "metadata.yaml") 
+
+    with open(file, "r") as filehandle:
+        metadata=yaml.load(filehandle, yaml.SafeLoader)
+
+    assert "thresholds" in metadata
+    return metadata["thresholds"]
+
+
+def compute_parts_masks(file, body, wing, min_body_area, iterations=10):
+
+    frame=cv2.imread(file)
+    img=frame.copy()
+    if img.shape[2] == 3:
+        img = img[:,:,0]
+
+    body_mask=np.uint8(255 * (img < body))
+    _, contours, _ = cv2.findContours(body_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contour_area=0
+    if len(contours) > 0:
+        contours = [sorted(contours, key=lambda cnt: cv2.contourArea(cnt), reverse=True)[0]]
+        contour_area = cv2.contourArea(contours[0]) 
+
+
+    while len(contours) == 0 or contour_area < min_body_area:
+        if conf.DEBUG:
+            print(f"{contour_area} < {min_body_area}")
+        if len(contours) > 0:
+            contours = [sorted(contours, key=lambda cnt: cv2.contourArea(cnt), reverse=True)[0]]
+            contour_area = cv2.contourArea(contours[0]) 
+            if conf.DEBUG_FIND_WING:
+                mask = np.zeros_like(img)
+                mask=cv2.drawContours(mask, contours, -1, 255, -1)
+                cv2.imshow("body_mask", mask)
+                cv2.waitKey(0)
+        
+        if contour_area >= min_body_area:
+            break
+
+        body += 1
+        body_mask=np.uint8(255 * (img < body))
+        _, contours, _ = cv2.findContours(body_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+
+    wing_mask = np.uint8(
+        255 * np.bitwise_and(
+            img >= body,
+            img < wing
+        )
+    )
+
+    if conf.DEBUG_FIND_WING:
+        cv2.imshow("final_wing_mask", wing_mask)
+        cv2.imshow("final_body_mask", body_mask)
+        cv2.waitKey(0)
+        
+
+
+    all_bodies = cv2.bitwise_or(
+        body_mask,
+        np.uint8(255 * (img == 255))
+    )
+
+    # remove contour around body which may be assigned to wings
+    all_bodies=cv2.dilate(all_bodies, kernel=np.ones((5, 5)), iterations=iterations)
+    wing_mask[all_bodies==255]=0
+
+    return img, {"body": body_mask, "wing": wing_mask, "all_bodies": all_bodies}
+
+
+def correct_rotation(file, min_body_area, min_wing_area, body, wing, iterations=10):
+    dest=os.path.sep.join(file.split(os.path.sep)[-3:])
+    fn, ext=os.path.splitext(dest)
+   
+    frame, masks=compute_parts_masks(file, min_body_area=min_body_area, body=body, wing=wing, iterations=iterations)
+
+    def find_wing_contour(masks):
+        # subset central third of the image vertically
+        wing_mask=masks["wing"]
+        wing_mask=wing_mask[:, (wing_mask.shape[1] // 3):(2*wing_mask.shape[1] // 3)]
+        _, contours, _ = cv2.findContours(wing_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if len(contours) > 0:
+            contours=sorted(contours, key=lambda cnt: cv2.contourArea(cnt), reverse=True)
+            if cv2.contourArea(contours[0]) < min_wing_area:
+                contours=[]
+
+        return contours
+    
+    if conf.DEBUG_FIND_WING:
+        cv2.imshow(f"wing mask after {iterations} iterations", masks["wing"])
+        cv2.imshow(f"img", frame)
+        cv2.waitKey(0)
+
+    contours=find_wing_contour(masks)
+
+    while len(contours) == 0 and iterations > 2:
+        iterations-=1
+        frame, masks=compute_parts_masks(file, min_body_area=min_body_area, body=body, wing=wing, iterations=iterations)
+        if conf.DEBUG_FIND_WING:
+            cv2.imshow(f"wing mask after {iterations} iterations", masks["wing"])
+            cv2.imshow(f"img", frame)
+            cv2.waitKey(0)
+        contours=find_wing_contour(masks)
+
+    cv2.destroyAllWindows()
+    
+    if len(contours) == 0:
+        warnings.warn(f"Cannot detect wings on {file}")
+        return (255*np.ones_like(frame), False), np.zeros_like(frame)
+
+    else:
+        wing_mask=masks["wing"]
+        
+    for mask in masks:
+        mask_fn=os.path.join(
+            conf.MASKS_FOLDER, f"{fn}_{mask}{ext}"
+        )
+        os.makedirs(os.path.dirname(mask_fn), exist_ok=True)
+        cv2.imwrite(mask_fn, masks[mask])
+
+
+    mask = np.zeros_like(wing_mask)
+    mask=cv2.drawContours(mask, contours, -1, 255, -1)
+    
+    y,x=center_of_mass(mask)
+
+    if y < mask.shape[0] / 2:
+        # wings are above
+        frame=frame[::-1,:]
+        flip=True
+    else:
+        # wings are below
+        flip=False
+
+
+    # hide_other_flies(file, frame, wing_mask)
+    frame=hide_other_flies_v2(frame, wing)    
+    return (frame, flip), mask
+
+def hide_other_flies(file, frame, wing_mask):
+   # TODO
+    # To mask the wings of other animals
+    # Not working well at the moment
+    d=load_pickle_file(file)
+    corner=d["corner"]
+    contour=d["contour"]
+
+    cv2.imshow("wing_mask", wing_mask)
+    cv2.waitKey(0)
+    body_mask=np.zeros_like(wing_mask)
+    body_mask=cv2.drawContours(body_mask, contour, -1, 255, -1)
+    cv2.imshow("body_mask", body_mask)
+    cv2.waitKey(0)
+    fly_mask=cv2.bitwise_or(wing_mask, body_mask)
+    frame[fly_mask!=255]=255
+    return frame
+
+def hide_other_flies_v2(frame, wing):
+    img=frame.copy()
+    blur=cv2.GaussianBlur(img, (5, 5), 1, 1, cv2.BORDER_REPLICATE)
+
+    _, flies_mask=cv2.threshold(blur, thresh=wing, maxval=255, type=cv2.THRESH_BINARY_INV)
+    # cv2.imshow("mask_dirty", flies_mask)
+    _, contours, _  = cv2.findContours(flies_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # TODO
+    # Change the hardcoded min_fly_area of 2000 to something which is a function of the animal size 
+    # contours=[cnt for cnt in contours if cv2.contourArea(cnt) > 2000]
+    contours=sorted(contours, key=lambda cnt: cv2.contourArea(cnt), reverse=True)
+    if len(contours) > 1:
+        contours=[contours[0]]
+
+    flies_mask_clean=np.zeros_like(flies_mask)
+    flies_mask_clean=cv2.drawContours(flies_mask_clean, contours, -1, 255, -1)
+    img[flies_mask_clean==0]=255
+
+    if conf.DEBUG_HIDE_BACKGROUND:
+        cv2.imshow("fly without neighbors", img)
+        cv2.waitKey(0)
+    return img
+
+def load_pickle_file(mmpy_file_05_final):
+    pickle_file = os.path.join(
+        conf.CONTOURS_FOLDER, mmpy_file_05_final.replace(os.path.join(conf.DATASET_FOLDER["mmpy"], "step1"), "").lstrip("/")
+    ).replace("_05_final.png", ".pkl")
+
+    with open(pickle_file,"rb") as filehandle:
+        d=pickle.load(filehandle)
+    
+    return d
+
+
+
+def correct_rotation_all(experiment, index):
+
+    thresholds=load_thresholds(experiment)
+    files = glob.glob(
+        os.path.join(
+            conf.DATASET_FOLDER["mmpy"], "step1", experiment, "*"
+        )
+    )
+
+    body_size=get_video_object(experiment, 1).median_body_length
+    min_wing_area=(body_size/7)**2
+    min_body_area=(body_size/2)**2
+
+    for file in files:
+        (frame, flip), wing_mask=correct_rotation(file, min_body_area, min_wing_area, **thresholds)
+        fn = os.path.join(
+            conf.DATASET_FOLDER["mmpy"], experiment, os.path.basename(file) + "_06_corrected.png"
+        )
+
+        os.makedirs(os.path.dirname(fn), exist_ok=True)
+        cv2.imwrite(fn, frame)
+
+        for folder in conf.DATASET_FOLDER:
+            if folder == "mmpy":
+                continue
+            else:
+                other_file = file.replace(conf.DATASET_FOLDER["mmpy"], conf.DATASET_FOLDER[folder])
+                img=cv2.imread(other_file)
+                if flip:
+                    img=img[::-1,:]
+
+                fn = os.path.join(
+                    conf.DATASET_FOLDER[folder], experiment, os.path.basename(other_file) + "_06_corrected.png"
+                )
+                os.makedirs(os.path.dirname(fn), exist_ok=True)
+                cv2.imwrite(fn, img)
+
+
+def crop_animals(experiment, trajectories, sampling_points, tolerance, thresholds=None):
+
+    store = imgstore.new_for_filename(get_store_path(experiment))
+
+    if sampling_points._type == "interval":
+        print("Getting all frame_time")
+        index=np.array(store._index.get_all_metadata()["frame_time"])
+        sampling_points.set(index)
+
+    sampling_points_per_chunk={}
+    starts_per_chunk={}
+    last_chunk=store._index.find_all("frame_number", store._index._summary("frame_max"))[0]
+    for chunk in range(last_chunk):
+        starts_per_chunk[chunk]=store._get_chunk_metadata(chunk)["frame_time"][0]
+
+    sampling_points_per_chunk_=OrderedDict()
+    for chunk in starts_per_chunk:
+        if (chunk+1) in starts_per_chunk:
+            sampling_points_per_chunk_[chunk]=sampling_points[
+                np.bitwise_and(
+                    sampling_points > starts_per_chunk[chunk],
+                    sampling_points < starts_per_chunk[chunk+1]
+                )
+            ]
+        else:
+            sampling_points_per_chunk_[chunk]=sampling_points[sampling_points > starts_per_chunk[chunk]]
+
+   
+    sampling_points_per_chunk=OrderedDict()
+    for chunk in sampling_points_per_chunk_:
+        if len(sampling_points_per_chunk_[chunk]) > 0:
+            sampling_points_per_chunk[chunk] = sampling_points_per_chunk_[chunk]
+
+    for chunk in sampling_points_per_chunk:
+        print(f"{chunk}: {len(sampling_points_per_chunk[chunk])}")
+
+
+    if conf.MULTIPROCRESSING:
+        joblib.Parallel(n_jobs=conf.N_JOBS_CHUNKS)(
+            joblib.delayed(process_chunk)(
+                chunk, experiment, trajectories, tolerance, sampling_points_per_chunk[chunk], thresholds
+            ) for chunk in sampling_points_per_chunk
+        )
+    
+    # TODO Either reimplement or remove
+    # elif conf.MULTITHREADING:
+
+    #     threads=[
+    #         threading.Thread(
+    #             target=process_timepoint,
+    #             kwargs={
+    #                 "experiment": experiment, "trajectories": trajectories,
+    #                 "tolerance": tolerance, "msec": msec, "thresholds": thresholds
+    #             },
+    #             daemon=True
+    #             )
+    #         for msec in sampling_points
+    #     ]
+    #     for t in threads:
+    #         t.start()
+        
+    #     for t in threads:
+    #         t.join()
+    
+    else:
+        # pbar=tqdm.tqdm(sampling_points_per_chunk, desc="Processing chunk")
+        # for chunk in pbar:
+        for chunk in sampling_points_per_chunk:
+            # pbar.set_description(f"Processing chunk {chunk}")
+            process_chunk(chunk, experiment, trajectories, tolerance, sampling_points_per_chunk[chunk], thresholds)
+
+
+def process_chunk(chunk, experiment, trajectories, tolerance, chunk_points, thresholds=None):
+    store = imgstore.new_for_filename(get_store_path(experiment))
+    # img, (fn, ft) = store.get_chunk(chunk)
+    img, (fn, ft) = store.get_nearest_image(chunk_points[0]-1)
+    metadata=store._index.get_chunk_metadata(chunk)
+
+    assert chunk_points[0] >= ft
+    list_of_blobs = idtrackerai.list_of_blobs.ListOfBlobs.load(
+        get_collections_file(experiment, chunk)
+    )
+    
+    video_object = get_video_object(experiment, chunk)
+    body_size=round(video_object.median_body_length)
+    frame_index = store._chunk_current_frame_idx
+
+    for msec in tqdm.tqdm(chunk_points):
+        if frame_index > len(metadata["frame_number"]):
+            break
+
+        process_timepoint(
+            experiment=experiment, store=store, trajectories=trajectories,
+            tolerance=tolerance,  msec=msec, thresholds=thresholds,
+            body_size=body_size, list_of_blobs=list_of_blobs, frame_index=frame_index
+        )
+        frame_index+=1
+        
+
+def process_timepoint(experiment, store, trajectories, body_size, list_of_blobs, tolerance, msec, frame_index, thresholds=None):
+
+    # load .mp4 dataset
+    with Timer(text="Getting next frame took {:.8f}", logger=timer_logger.debug):            
+        frame, (frame_number, frame_time) = store.get_next_image()
+
+    if store._index._summary("frame_max") == frame_number:
+        warnings.warn("You are reading the last frame of the imgstore", stacklevel=2)
+
+    logger.debug(f"Working on {frame_number} ({frame_time} ms)")
+    chunk = store._chunk_n
+
+    error = np.abs(msec - frame_time)  
+    assert error < tolerance, f"{error} ms is higher than the tolerance value of {tolerance} ms"
+
+    with Timer(text="Computing real frame number took {:.8f}", logger=timer_logger.debug):            
+        real_fn = store.obtain_real_frame_number(frame_number)
+  
+    try:
+        blobs_in_frame=list_of_blobs.blobs_in_video[frame_index]
+    except Exception as error:
+        warnings.warn(f"Chunk {chunk} does not have data for frame_index {frame_index}", stacklevel=2)
+        raise error
+
+    # cropped_contours=[]
+    # corners=[]
+    for animal in np.arange(trajectories.shape[1]):
+    
+        # define where the files will be saved
+        filepath = os.path.join(
+            experiment,
+            os.path.join(experiment, str(frame_number).zfill(10), str(animal) + ".png").replace("/", "-")
+        ) 
+        # pick the data for this animal in this frame number
+        with Timer(text="Picking animal took {:.8f}", logger=timer_logger.debug):            
+            tr = pick_animal(trajectories, real_fn, animal)
+        if type(tr) is IndexError:
+            logger.debug(error)
+            warnings.warn(f"{experiment} is not analyzed after {round(msec/1000/3600, 2)} hours", stacklevel=2)
+            break
+
+        try:
+            centroid = tuple([round(e) for e in tr])
+        except ValueError:
+            # contains NaN
+            warnings.warn(f"Animal #{animal} not found in frame {frame_number} of {experiment}", stacklevel=2)
+            continue
+
+        with Timer(text="Getting contours took {:.8f}", logger=timer_logger.debug):            
+            contour, other_contours = find_contour(blobs_in_frame, centroid, frame=frame)
+        # TODO Properly unpack the output of crop_animal_in_time_and_space
+
+        with Timer(text="Cropping animal in time and space took {:.8f}", logger=timer_logger.debug):
+            _,_, data2=crop_animal_in_time_and_space(frame.copy(), centroid=centroid, body_size=body_size, filepath=filepath, contour=contour, other_contours=other_contours, thresholds=thresholds)
+
+        if data2 is None:
+            return
+
+        # corners.append(data2[-1])
+        # cropped_contours.append(contour-corners[-1])
+        corner = data2[-1]
+        cropped_contour = contour-corner
+        
+        with Timer(text="Saving to pickle file took {:.8f}", logger=timer_logger.debug):
+            fn, _=os.path.splitext(os.path.basename(filepath))
+            pickle_file=os.path.join(conf.CONTOURS_FOLDER, experiment, f"{fn}.pkl")
+            os.makedirs(os.path.dirname(pickle_file), exist_ok=True)
+            with open(pickle_file, "wb") as filehandle:
+                pickle.dump({"corner": corner, "contour": cropped_contour}, filehandle)
+
+
+def generate_dataset(experiment, sampling_points, tolerance=100, compute_thresholds=True, crop=True, rotate=True):
     """
-    Generate a dataset of frames for POSE labeling
+    Generate a dataset of frames for pose labeling
     from a flyhostel experiment
     
     Arguments:
@@ -271,81 +755,43 @@ def generate_dataset(experiment, sampling_points, tolerance=100):
     * tolerance (int): Tolerance between wished sampling time and available time in dataset, in msec
     """
     
-    print(experiment)
+    logger.info(experiment)
     
     tr_file = get_trajectories_file(experiment)
     time_file = get_timestamps_file(experiment)
     
     assert os.path.exists(tr_file), f"{tr_file} does not exist"
     assert os.path.exists(time_file), f"{time_file} does not exist"
-    
-    # load .mp4 dataset
-    store = imgstore.new_for_filename(get_store_path(experiment))
 
     # load trajectories and timestamps
     trajectories = np.load(tr_file)
-    trajectories_int = np.array(trajectories, np.int64)
     timestamps = np.load(time_file)
     
     assert len(timestamps) == trajectories.shape[0]
     
-    
-    lists_of_blobs = {}
-    videos = {}
-    
     # missing_data = np.isnan(trajectories).any(axis=2).mean(axis=0)
-    
-    for msec in tqdm.tqdm(sampling_points):
 
-        frame, (frame_number, frame_time) = store.get_nearest_image(msec)
-        chunk = store._chunk_n
-        
-        if not chunk in lists_of_blobs:
-            lists_of_blobs[chunk] = idtrackerai.list_of_blobs.ListOfBlobs.load(
-                get_collections_file(experiment, chunk)
-            )
-        
-        if not chunk in videos:
-            videos[chunk] = get_video_object(experiment, chunk)
-    
-        try:
-            frame_index = store._get_chunk_metadata(chunk)["frame_number"].index(frame_number)
-        except ValueError:
-            warnings.warn(f"{frame_number} not found in {experiment}-{chunk}")
-            continue
+    if compute_thresholds:
+        sample=sampling_points.sample(10)
+        crop_animals(experiment, trajectories, sample, tolerance=tolerance)
+        plot_intensity_histogram(experiment)
 
-        blobs_in_frame = lists_of_blobs[chunk].blobs_in_video[frame_index]
-        
+    if crop:
         try:
-            trajectories_frame=trajectories[frame_number,:, :]
+            thresholds=load_thresholds(experiment)
+        except Exception:
+            thresholds=None
+        index=crop_animals(experiment, trajectories, sampling_points, thresholds=thresholds, tolerance=tolerance)
+    else:
+        index=None
+    if rotate:
+        correct_rotation_all(experiment, index)
+
+
+
+def pick_animal(trajectories, frame_number, animal):
+        try:
+            return trajectories[frame_number, animal, :]
         except IndexError as error:
-            logger.debug(error)
-            warnings.warn(f"{experiment} is not analyzed after {round(msec/1000/3600, 2)} hours", stacklevel=2)
-            break
+            return error
         
-        
-        error = np.abs(msec - frame_time)
-        
-        assert error < tolerance, f"{error} is higher than {tolerance} ms"
-    
-        for animal in np.arange(trajectories.shape[1]):
-        
-            # define where the files will be saved
-            filepath = os.path.join(
-                experiment,
-                os.path.join(experiment, str(frame_number).zfill(10), str(animal) + ".png").replace("/", "-")
-            ) 
-            # pick the data for this animal
-            tr = trajectories_frame[animal, :]
-
-            try:
-                centroid = tuple([round(e) for e in tr])
-            except ValueError:
-                # contains NaN
-                warnings.warn(f"Animal #{animal} not found in frame {frame_number} of {experiment}", stacklevel=2)
-                continue               
-                
-            contour, other_contours = find_contour(blobs_in_frame, centroid)
-            body_size=round(videos[chunk].median_body_length)
-
-            crop_animal_in_time_and_space(frame.copy(), contour, other_contours, centroid, body_size, filepath)

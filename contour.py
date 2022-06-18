@@ -1,3 +1,5 @@
+import logging
+
 import numpy as np
 import cv2
 from decorators import timeit
@@ -9,6 +11,8 @@ try:
     conf += local_settings
 except ImportError:
     pass
+
+logger = logging.getLogger(__name__)
 
 
 @timeit
@@ -64,12 +68,12 @@ def compute_contour(img, intensity, area):
     
     return contour
 
-def find_contour(blobs_in_frame, centroid):
+def find_contour(blobs_in_frame, centroid, frame=None):
     """
     Arguments:
     
     * blobs_in_frame: (list): A list where every element is an idtrackerai.Blob instance
-    * centroid (tuple): x and y coordinates of the contour center
+    * centroid (tuple): x and y coordinates of the contour center, with origin (0, 0) set to top left corner
     
     Returns:
     
@@ -84,10 +88,18 @@ def find_contour(blobs_in_frame, centroid):
         if conf.DEBUG:
             print(f"isin took {msec} msecs")
         if overlaps:
-            contour=blob.contour
+            contour=blob.contour.copy()
         else:
-            other_contours.append(blob.contour)
+            other_contours.append(blob.contour.copy())
+
+    if conf.DEBUG_COORDS and frame is not None:
+        frame=cv2.circle(frame.copy(), centroid, 20, 255, -1)
+        cv2.imshow("debug", cv2.resize(frame, (300, 300), cv2.INTER_AREA))
+        cv2.waitKey(0)
     
+    if contour is not None:
+        logger.debug(f"{len(contour)} contours found")
+
     return contour, other_contours
 
 

@@ -1,5 +1,5 @@
 import os.path
-
+import logging
 import matplotlib.pyplot as plt
 plt.set_cmap("gray")
 
@@ -14,6 +14,7 @@ except ImportError:
     pass
 
 
+logger = logging.getLogger(__name__)
 
 def plot_cloud(cloud):
     """
@@ -52,8 +53,8 @@ def plot_decomposition(crop, T):
     ax.imshow(cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR))
     v1 = T[:, 0]
     v2 = T[:, 1]
-    ax.quiver(*center, v1[0], v1[1], clim=[-np.pi, np.pi], angles='xy', scale_units='xy', scale=1/100)
-    ax.quiver(*center, v2[0], v2[1], clim=[-np.pi, np.pi], angles='xy', scale_units='xy', scale=1/50)
+    ax.quiver(*center, v1[0], -v1[1], clim=[-np.pi, np.pi], angles='xy', scale_units='xy', scale=1/100)
+    ax.quiver(*center, v2[0], -v2[1], clim=[-np.pi, np.pi], angles='xy', scale_units='xy', scale=1/50)
     return fig
 
 def plot_rotation(crop, mask, T, cloud, filepath):
@@ -70,14 +71,27 @@ def plot_rotation(crop, mask, T, cloud, filepath):
     * T (np.ndarray): Matrix of eigenvectors, where each vector is a column
     * filepath (str): Path to save the visualizations
     """
-    cv2.imwrite(os.path.join(conf.DEBUG_FOLDER, filepath.replace(".png", "_01_original.png")), crop)
-    cv2.imwrite(os.path.join(conf.DEBUG_FOLDER, filepath.replace(".png", "_02_mask.png")), mask)
+    path=os.path.join(conf.DEBUG_FOLDER, filepath.replace(".png", "_01_original.png"))
+
+    folder = os.path.dirname(path)
+    os.makedirs(folder, exist_ok=True)
+
+    logger.debug(f'Saving -> {path}')
+    cv2.imwrite(path, crop)
+
+    path=os.path.join(conf.DEBUG_FOLDER, filepath.replace(".png", "_02_mask.png"))
+    logger.debug(f'Saving -> {path}')
+    cv2.imwrite(path, mask)
     
     fig = plot_decomposition(crop, T)
-    fig.savefig(os.path.join(conf.DEBUG_FOLDER, filepath.replace(".png", "_03_v1.png")))
+    path=os.path.join(conf.DEBUG_FOLDER, filepath.replace(".png", "_03_v1.png"))
+    logger.debug(f'Saving -> {path}')
+    fig.savefig(path)
     plt.close()
 
 
     fig = plot_cloud(cloud)
-    fig.savefig(os.path.join(conf.DEBUG_FOLDER, filepath.replace(".png", "_04_cloud.png")))
+    path=os.path.join(conf.DEBUG_FOLDER, filepath.replace(".png", "_04_cloud.png"))
+    logger.debug(f'Saving -> {path}')
+    fig.savefig(path)
     plt.close()
