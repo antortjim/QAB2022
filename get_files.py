@@ -67,9 +67,5 @@ def load_conf(experiment):
 
 
 def get_experiments():
-
-    with open("experiments.txt", "r") as filehandle:
-        experiments = [e.strip("\n") for e in filehandle.readlines()]
-    experiments = [e for e in experiments if e[0] != "#"]
-    print(experiments)    
+    experiments=pd.read_csv("experiments.csv", comment="#", sep=",")
     return experiments

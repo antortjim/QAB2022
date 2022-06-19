@@ -1,0 +1,6 @@
+profiling/*
+output/
+FlySLEAP/
+cache/
+__pycache__/
+.ipynb_checkpoints/
