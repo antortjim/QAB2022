@@ -16,14 +16,19 @@ logger = logging.getLogger(__name__)
 
 
 @timeit
-def isin(centroid, contour):
+def isin(centroid, contour, i="", shape=None):
     """
     Return True if the centroid is contained by the contour    
     """
 
     centroid = tuple([int(e) for e in centroid])
     x_max, y_max = contour.max(axis=0).flatten()
-    mask=np.zeros((y_max, x_max), np.uint8)
+
+    x_max = y_max = max(y_max, x_max)
+    if shape is None:
+        shape=(y_max, x_max)
+
+    mask=np.zeros(shape, np.uint8)
     mask=cv2.drawContours(
         mask,
         [contour],
@@ -34,6 +39,9 @@ def isin(centroid, contour):
         # fill inside
         -1
     )
+
+    if conf.DEBUG_FIND_CONTOUR:
+        cv2.imshow(f"mask {i}", cv2.resize(mask, (300, 300), cv2.INTER_AREA))
 
     try:
         return mask[centroid[1], centroid[0]] == 255
@@ -83,8 +91,8 @@ def find_contour(blobs_in_frame, centroid, frame=None):
     other_contours=[]
     contour=None
 
-    for blob in blobs_in_frame:
-        overlaps, msec = isin(centroid, blob.contour)
+    for blob_i, blob in enumerate(blobs_in_frame):
+        overlaps, msec = isin(centroid, blob.contour, blob_i, frame.shape)
         if conf.DEBUG:
             print(f"isin took {msec} msecs")
         if overlaps:
@@ -92,13 +100,15 @@ def find_contour(blobs_in_frame, centroid, frame=None):
         else:
             other_contours.append(blob.contour.copy())
 
-    if conf.DEBUG_COORDS and frame is not None:
+    if contour is not None:
+        logger.debug(f"{len(contour)} contours found")
+    elif conf.DEBUG_FIND_CONTOUR and frame is not None:
         frame=cv2.circle(frame.copy(), centroid, 20, 255, -1)
         cv2.imshow("debug", cv2.resize(frame, (300, 300), cv2.INTER_AREA))
         cv2.waitKey(0)
-    
-    if contour is not None:
-        logger.debug(f"{len(contour)} contours found")
+        import ipdb; ipdb.set_trace()
+
+    cv2.destroyAllWindows()
 
     return contour, other_contours
 
