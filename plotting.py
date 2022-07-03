@@ -95,3 +95,11 @@ def plot_rotation(crop, mask, T, cloud, filepath):
     logger.debug(f'Saving -> {path}')
     fig.savefig(path)
     plt.close()
+    
+
+def plot_stat(arr, plot=True):
+    arr = arr.copy()
+    arr -= arr.min()
+    img = np.uint8(255*arr/arr.max())
+    if plot: plt.imshow(img)
+    return img 
