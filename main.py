@@ -2,8 +2,8 @@ import logging
 import logging.config
 import os.path
 import yaml
-import joblib
 import numpy as np
+import shlex
 # import imgstore.stores.multi as imgstore
 
 LOGGING_FILE=os.path.join(os.environ["HOME"], ".config", "qab2022.yaml")
@@ -11,7 +11,6 @@ LOGGING_FILE=os.path.join(os.environ["HOME"], ".config", "qab2022.yaml")
 from get_files import get_experiments
 from library import generate_dataset
 import utils
-from timepoints import TimePoints
 
 from confapp import conf
 try:
@@ -30,18 +29,33 @@ logging.config.dictConfig(config)
 
 def main():
     
-    experiments=get_experiments()
-    # sampling_points_msec = np.linspace(start = utils.hours(1), stop=utils.hours(36), num=100)[:2] *1000
-    # sampling_points_msec = (utils.hours(1.1) * 1000, utils.hours(2.1) * 1000)
+    metadata=get_experiments()
+    experiments = metadata["experiment"]
 
-    sampling_points_msec = (utils.hours(1.1) * 1000, utils.hours(1.15) * 1000)
-    sampling_points_msec = (4133681, 4134681)
+    if conf.EXPERIMENT_PROCESS:
+        import joblib
 
-    joblib.Parallel(n_jobs=conf.N_JOBS_EXPERIMENTS)(
-        joblib.delayed(generate_dataset)(
-            experiment, TimePoints(sampling_points_msec), compute_thresholds=False, tolerance=conf.TOLERANCE, crop=True, rotate=True
-        ) for experiment in experiments[:2]
-    )
+        joblib.Parallel(n_jobs=conf.N_JOBS_EXPERIMENTS)(
+            joblib.delayed(generate_dataset)(
+                experiment, compute_thresholds=conf.COMPUTE_THRESHOLDS, tolerance=conf.TOLERANCE, crop=conf.CROP, rotate=conf.ROTATE
+            ) for i, experiment in enumerate(experiments)
+        )
+        
+    elif conf.EXPERIMENT_SUBPROCESS:
+        import subprocess
+
+        subprocesses=[]
+        for i, experiment in enumerate(experiments):
+            cmd = f"python main_sp.py --experiment {experiment}"
+            cmd_l = shlex.split(cmd)
+            subprocesses.append(
+                subprocess.Popen(
+                    cmd_l
+                )
+            )
+    else:
+        for i, experiment in enumerate(experiments):
+            generate_dataset(experiment, compute_thresholds=conf.COMPUTE_THRESHOLDS, tolerance=conf.TOLERANCE, crop=conf.CROP, rotate=conf.ROTATE)
     
 if __name__ == "__main__":
     main()
