@@ -9,6 +9,8 @@ class TimePoints:
             self._type="points"
         elif type(self._timepoints) is tuple:
             self._type="interval"
+        else:
+            raise Exception(f"timepoints is of type {type(timepoints)}. Please pass a tuple or a np.ndarray")
 
     def sample(self, n):
         if self._type == "points":
@@ -52,12 +54,21 @@ class TimePoints:
         return self._timepoints - other
 
     def __getitem__(self, idx):
-        return self.__class__(self._timepoints[idx])
+        # make sure the output is still an array, even if of length 1
+        # this is needed to not have an exception thrown in the init
+        # because otherwise the type is np.float64 or np.int64 instead of np.array
+        # return self.__class__(np.array(self._timepoints[idx]))
+        data=self._timepoints[idx]
+        if type(data) is np.ndarray:
+            return self.__class__(data)
 
+        else:
+            return data
+        
 
     def __repr__(self):
         return self._timepoints.__repr__()
-
+    
     def __iter__(self):
         assert self._type == "points"
 
