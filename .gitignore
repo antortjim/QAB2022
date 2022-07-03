@@ -4,3 +4,8 @@ FlySLEAP/
 cache/
 __pycache__/
 .ipynb_checkpoints/
+*.ipynb
+2022-06-20_FlySLEAP/
+videos/
+teach_data/
+2022-06_output/
