@@ -26,9 +26,11 @@ from get_files import (
     get_trajectories_file,
     get_timestamps_file,
     get_collections_file,
-    get_store_path
+    get_store_path,
+    get_experiments,
 )
-from utils import package_frame_for_labeling, obtain_real_frame_number
+from utils import package_frame_for_labeling, obtain_real_frame_number, adjust_to_zt0, hours
+from timepoints import TimePoints
 
 from confapp import conf
 
@@ -123,12 +125,19 @@ def crop_animal_in_time_and_space(frame, centroid, body_size, filepath, contour,
         plot_rotation(raw_crop, mask, T, cloud_centered, filepath)
 
     # save
-    for folder in conf.DATASET_FOLDER:
-        path=os.path.join(conf.DATASET_FOLDER[folder], "step1", filepath.replace(".png", "_05_final.png"))
-        with Timer(text=f"Saving {path} took " + "{:.8f}", logger=timer_logger.debug):
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            logger.debug(f'Saving -> {path}')
-            cv2.imwrite(path, frames[folder])
+    if conf.COMPUTE_THRESHOLDS:
+        path=os.path.join(conf.HISTOGRAM_FOLDER, filepath)
+        logger.debug(f'Saving -> {path}')
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        cv2.imwrite(path, frames["mmpy"])
+
+    else:
+        for folder in conf.DATASET_FOLDER:
+            path=os.path.join(conf.DATASET_FOLDER[folder], "step1", filepath.replace(".png", "_05_final.png"))
+            with Timer(text=f"Saving {path} took " + "{:.8f}", logger=timer_logger.debug):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                logger.debug(f'Saving -> {path}')
+                cv2.imwrite(path, frames[folder])
 
     return raw_crop, rotated, (T, mask, cloud, cloud_centered, cloud_center, rotate_matrix, top_left_corner)
 
@@ -300,13 +309,13 @@ def plot_intensity_histogram(experiment):
 
     files = glob.glob(
         os.path.join(
-            conf.DATASET_FOLDER["mmpy"], "step1", experiment, "*"
+            conf.HISTOGRAM_FOLDER, experiment, "*.png"
         )
     )
 
-    arrs = [
-        cv2.imread(f) for f in files
-    ]
+    arrs=[]
+    for f in tqdm.tqdm(files, desc="Loading data to generate histogram"):
+        arrs.append(cv2.imread(f))
     
     data=np.float64(np.stack(arrs, axis=-1).flatten())
 
@@ -332,7 +341,7 @@ def plot_intensity_histogram(experiment):
     ax=fig.add_subplot()
     ax.bar(x_round, y_round)
     ax.set_xticks(np.arange(0, 255, 5), np.arange(0, 255, 5))
-    fn=os.path.join(conf.HISTOGRAM_FOLDER, experiment+".png")
+    fn=os.path.join(conf.HISTOGRAM_FOLDER, os.path.dirname(experiment), os.path.basename(experiment)+".jpg")
     os.makedirs(os.path.dirname(fn), exist_ok=True)
     plt.savefig(fn)
 
@@ -568,12 +577,17 @@ def correct_rotation_all(experiment, index):
                 cv2.imwrite(fn, img)
 
 
+        # NOTE
+        # To make a movie with all the frames in a folder, assuming frames are 200x200
+        # cat *jpg | ffmpeg -y -r 40  -vsync 0 -s 200x200   -i - -an -c:v h264_nvenc $(basename `pwd`).mp4
+
 def crop_animals(experiment, trajectories, sampling_points, tolerance, thresholds=None):
+
+    assert len(sampling_points) > 0
 
     store = imgstore.new_for_filename(get_store_path(experiment))
 
     if sampling_points._type == "interval":
-        print("Getting all frame_time")
         index=np.array(store._index.get_all_metadata()["frame_time"])
         sampling_points.set(index)
 
@@ -584,6 +598,8 @@ def crop_animals(experiment, trajectories, sampling_points, tolerance, threshold
         starts_per_chunk[chunk]=store._get_chunk_metadata(chunk)["frame_time"][0]
 
     sampling_points_per_chunk_=OrderedDict()
+
+    
     for chunk in starts_per_chunk:
         if (chunk+1) in starts_per_chunk:
             sampling_points_per_chunk_[chunk]=sampling_points[
@@ -642,36 +658,57 @@ def crop_animals(experiment, trajectories, sampling_points, tolerance, threshold
 
 def process_chunk(chunk, experiment, trajectories, tolerance, chunk_points, thresholds=None):
     store = imgstore.new_for_filename(get_store_path(experiment))
-    # img, (fn, ft) = store.get_chunk(chunk)
-    img, (fn, ft) = store.get_nearest_image(chunk_points[0]-1)
-    metadata=store._index.get_chunk_metadata(chunk)
+    img, (fn, ft) = store.get_chunk(chunk)
+    img, (fn, ft) = store.get_nearest_image(chunk_points[0]-1, past=True, future=False)
 
-    assert chunk_points[0] >= ft
+    # metadata=store._index.get_chunk_metadata(chunk)
+    #fns=metadata["frame_number"]
+    #frame_number_first=store.obtain_real_frame_number(fns[0])
+    #metadata["frame_number"]=np.arange(frame_number_first, len(fns) + frame_number_first, 1)
+
+    if not chunk_points[0] >= ft:
+        import ipdb; ipdb.set_trace()
+    
+    # assert chunk_points[0] >= ft, f"{chunk_points[0]} is already passed"
+
+
     list_of_blobs = idtrackerai.list_of_blobs.ListOfBlobs.load(
         get_collections_file(experiment, chunk)
     )
     
     video_object = get_video_object(experiment, chunk)
     body_size=round(video_object.median_body_length)
-    frame_index = store._chunk_current_frame_idx
+    frame_index = store._chunk_current_frame_idx-1
 
-    for msec in tqdm.tqdm(chunk_points):
-        if frame_index > len(metadata["frame_number"]):
-            break
+    for msec in tqdm.tqdm(chunk_points, desc=f"Working on chunk {chunk}"):
+
+        #if frame_index > len(metadata["frame_number"]):
+        #    break
+
+        if conf.COMPUTE_THRESHOLDS:
+            chunk_n, frame_index = store._index.find_chunk_nearest("frame_time", msec, future=False, past=True)
+            assert chunk == chunk_n
+        else:
+            frame_index+=1
+        
 
         process_timepoint(
             experiment=experiment, store=store, trajectories=trajectories,
             tolerance=tolerance,  msec=msec, thresholds=thresholds,
             body_size=body_size, list_of_blobs=list_of_blobs, frame_index=frame_index
         )
-        frame_index+=1
-        
+
+
 
 def process_timepoint(experiment, store, trajectories, body_size, list_of_blobs, tolerance, msec, frame_index, thresholds=None):
 
     # load .mp4 dataset
     with Timer(text="Getting next frame took {:.8f}", logger=timer_logger.debug):            
-        frame, (frame_number, frame_time) = store.get_next_image()
+        if conf.COMPUTE_THRESHOLDS:
+            frame, (frame_number, frame_time) = store.get_nearest_image(msec)
+        else:
+            frame, (frame_number, frame_time) = store.get_next_image()
+
 
     if store._index._summary("frame_max") == frame_number:
         warnings.warn("You are reading the last frame of the imgstore", stacklevel=2)
@@ -738,7 +775,7 @@ def process_timepoint(experiment, store, trajectories, body_size, list_of_blobs,
                 pickle.dump({"corner": corner, "contour": cropped_contour}, filehandle)
 
 
-def generate_dataset(experiment, sampling_points, tolerance=100, compute_thresholds=True, crop=True, rotate=True):
+def generate_dataset(experiment, tolerance=100, compute_thresholds=True, crop=True, rotate=True):
     """
     Generate a dataset of frames for pose labeling
     from a flyhostel experiment
@@ -754,6 +791,14 @@ def generate_dataset(experiment, sampling_points, tolerance=100, compute_thresho
     
     * tolerance (int): Tolerance between wished sampling time and available time in dataset, in msec
     """
+
+    metadata = get_experiments()
+    metadata = metadata.loc[metadata["experiment"] == experiment].squeeze()
+
+    zt0 = metadata["zt0"]
+    sampling_points_hour = [float(e) for e in metadata["sampling_points"].split("-")]
+    sampling_points = tuple([1000*hours(e) for e in sampling_points_hour])
+    sampling_points=TimePoints(sampling_points)
     
     logger.info(experiment)
     
@@ -766,13 +811,14 @@ def generate_dataset(experiment, sampling_points, tolerance=100, compute_thresho
     # load trajectories and timestamps
     trajectories = np.load(tr_file)
     timestamps = np.load(time_file)
+    timestamps = adjust_to_zt0(experiment, timestamps, zt0, reference="start_time")
     
     assert len(timestamps) == trajectories.shape[0]
     
     # missing_data = np.isnan(trajectories).any(axis=2).mean(axis=0)
 
     if compute_thresholds:
-        sample=sampling_points.sample(10)
+        sample=sampling_points.sample(conf.HISTOGRAM_SAMPLE_SIZE)
         crop_animals(experiment, trajectories, sample, tolerance=tolerance)
         plot_intensity_histogram(experiment)
 
