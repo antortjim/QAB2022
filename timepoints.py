@@ -56,7 +56,7 @@ class TimePoints:
 
 
     def __repr__(self):
-        print(self._timepoints)
+        return self._timepoints.__repr__()
 
     def __iter__(self):
         assert self._type == "points"
