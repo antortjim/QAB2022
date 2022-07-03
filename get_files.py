@@ -2,6 +2,7 @@ import json
 import logging
 import os.path
 from confapp import conf
+import pandas as pd
 import numpy as np
 try:
     import local_settings
